@@ -3,15 +3,21 @@
 #endif
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <clocale>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,6 +38,9 @@ constexpr std::size_t kMaxSize = 65507;
 constexpr std::uint16_t kHttpPort = 80;
 constexpr std::uint16_t kHttpsPort = 443;
 constexpr std::uint16_t kProxyPort = 10240;
+constexpr std::size_t kMaxCacheEntries = 128;
+constexpr std::size_t kMaxCacheObjectBytes = 2 * 1024 * 1024;
+constexpr const char* kFilterConfigPath = "proxy_rules.conf";
 
 void SetupUtf8Console() {
     SetConsoleOutputCP(CP_UTF8);
@@ -84,11 +93,31 @@ struct NetworkRuntime {
 };
 
 struct HttpHeader {
-    std::string method;//post get connect 
+    std::string method;//post get connect(专门给代理服务器使用的方法)
     std::string url;//ts4.tc.mm.bing.net:443
     std::string host;//ts4.tc.mm.bing.net:443
     std::string cookie;
 };
+
+struct CacheEntry {
+    std::string response;
+    std::string lastModified;
+    std::chrono::steady_clock::time_point storedAt;
+};
+
+struct FilterConfig {
+    std::vector<std::string> blockSites;
+    std::vector<std::string> blockUsers;
+};
+
+//这个缓存信息
+std::mutex gCacheMutex;
+std::unordered_map<std::string, CacheEntry> gHttpCache;
+
+//这个文件是我们的黑名单信息，因为会有多个用户连接代理服务器，所以需要上锁
+std::mutex gFilterMutex;
+FilterConfig gFilterConfig;
+bool SendAll(Socket sock, const char* data, std::size_t len);
 
 std::string Trim(std::string_view value) {
     const auto first = value.find_first_not_of(" \t");
@@ -97,6 +126,151 @@ std::string Trim(std::string_view value) {
     }
     const auto last = value.find_last_not_of(" \t");
     return std::string(value.substr(first, last - first + 1));
+}
+
+bool StartsWithCaseInsensitive(std::string_view text, std::string_view prefix) {
+    if (text.size() < prefix.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(text[i])));
+        const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(prefix[i])));
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+std::string NormalizeHost(std::string host) {
+    host = Trim(host);
+    if (!host.empty() && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    return ToLower(host);
+}
+
+bool MatchPattern(const std::string& value, const std::string& pattern) {
+    if (pattern == "*") {
+        return true;
+    }
+    if (pattern.size() > 2 && pattern[0] == '*' && pattern[1] == '.') {
+        const std::string suffix = pattern.substr(1);  // ".example.com"
+        if (value.size() >= suffix.size() &&
+            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return true;
+        }
+    }
+    if (!pattern.empty() && pattern.back() == '*') {
+        const std::string prefix = pattern.substr(0, pattern.size() - 1);
+        return value.rfind(prefix, 0) == 0;
+    }
+    return value == pattern;
+}
+
+//封装windows的api，获得用户程序的ip地址，来判断是否放行
+std::string ClientIpFromSockaddr(const sockaddr_storage& addr) {
+    char host[NI_MAXHOST]{};
+    const int rc = getnameinfo(reinterpret_cast<const sockaddr*>(&addr),
+                               (addr.ss_family == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6),
+                               host, sizeof(host), nullptr, 0, NI_NUMERICHOST);
+    if (rc == 0) {
+        return std::string(host);
+    }
+    return {};
+}
+
+//设置对应的配置文件，没有的话创建一个
+bool EnsureFilterConfigExists(const std::string& path) {
+    std::ifstream in(path);
+    if (in.good()) {
+        return true;
+    }
+
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out.good()) {
+        return false;
+    }
+    out << "# Proxy filter rules\n"
+        << "# key=value\n"
+        << "# site_block=bad.com\n"
+        << "# user_block=10.0.0.8\n"
+        << "# Supports exact and wildcard pattern\n"
+        << "# site_block=*.example.com\n"
+        << "# user_block=192.168.1.*\n";
+    return true;
+}
+
+bool LoadFilterConfig(const std::string& path) {
+    std::ifstream in(path);
+    if (!in.good()) {
+        return false;
+    }
+
+    FilterConfig cfg;
+    std::string line;
+    while (std::getline(in, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') {
+            continue;
+        }
+
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = ToLower(Trim(line.substr(0, eq)));
+        const std::string value = ToLower(Trim(line.substr(eq + 1)));
+        if (value.empty()) {
+            continue;
+        }
+
+        if (key == "site_block") {
+            cfg.blockSites.push_back(value);
+        } else if (key == "user_block") {
+            cfg.blockUsers.push_back(value);
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(gFilterMutex);
+    gFilterConfig = std::move(cfg);
+    return true;
+}
+
+bool IsAllowedByBlockList(const std::string& value, const std::vector<std::string>& blockRules) {
+    for (const auto& pattern : blockRules) {
+        if (MatchPattern(value, pattern)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsUserAllowed(const std::string& clientIp) {
+    std::lock_guard<std::mutex> lock(gFilterMutex);
+    return IsAllowedByBlockList(clientIp, gFilterConfig.blockUsers);
+}
+
+bool IsSiteAllowed(const std::string& host) {
+    const std::string normalizedHost = NormalizeHost(host);
+    std::lock_guard<std::mutex> lock(gFilterMutex);
+    return IsAllowedByBlockList(normalizedHost, gFilterConfig.blockSites);
+}
+
+void SendSimpleHttpError(Socket sock, int statusCode, const std::string& reason, const std::string& bodyText) {
+    const std::string body = bodyText + "\n";
+    std::string response = "HTTP/1.1 " + std::to_string(statusCode) + " " + reason + "\r\n";
+    response += "Content-Type: text/plain; charset=utf-8\r\n";
+    response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    response += "Connection: close\r\n\r\n";
+    response += body;
+    SendAll(sock, response.data(), response.size());
 }
 
 HttpHeader ParseHttpHead(const std::string& request) {
@@ -109,14 +283,19 @@ HttpHeader ParseHttpHead(const std::string& request) {
     const std::string firstLine = request.substr(0, lineEnd);
     const auto methodEnd = firstLine.find(' ');
     if (methodEnd != std::string::npos) {
+        //第一个空格之前的部分是method
         header.method = firstLine.substr(0, methodEnd);
+        //第二个空格之前的部分是url
         const auto urlEnd = firstLine.find(' ', methodEnd + 1);
         if (urlEnd != std::string::npos) {
             header.url = firstLine.substr(methodEnd + 1, urlEnd - methodEnd - 1);
         }
+        //其实还有一个是http的协议版本，但是这里忽略
     }
+
     //指向下一行的开头
     std::size_t cursor = lineEnd + 2;
+    //遍历剩下的行,寻找Host和Cookie
     while (cursor < request.size()) {
         const auto nextLineEnd = request.find("\r\n", cursor);
         if (nextLineEnd == std::string::npos || nextLineEnd == cursor) {
@@ -134,6 +313,164 @@ HttpHeader ParseHttpHead(const std::string& request) {
     }
 
     return header;
+}
+
+std::string BuildCacheKey(const HttpHeader& header) {
+    return header.host + "|" + header.url;
+}
+
+std::string RewriteProxyRequest(const std::string& request, const std::string& ifModifiedSince) {
+    const auto headerEnd = request.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        return request;
+    }
+    const auto firstLineEnd = request.find("\r\n");
+    if (firstLineEnd == std::string::npos || firstLineEnd > headerEnd) {
+        return request;
+    }
+
+    std::string rewritten;
+    rewritten.reserve(request.size() + 64);
+    rewritten.append(request.data(), firstLineEnd + 2);
+
+    bool hasIfModifiedSince = false;
+    std::size_t cursor = firstLineEnd + 2;
+    while (cursor < headerEnd) {
+        const auto lineEnd = request.find("\r\n", cursor);
+        if (lineEnd == std::string::npos || lineEnd > headerEnd) {
+            break;
+        }
+        std::string_view line(request.data() + cursor, lineEnd - cursor);
+        if (StartsWithCaseInsensitive(line, "Connection:") ||
+            StartsWithCaseInsensitive(line, "Proxy-Connection:")) {
+            cursor = lineEnd + 2;
+            continue;
+        }
+        if (StartsWithCaseInsensitive(line, "If-Modified-Since:")) {
+            hasIfModifiedSince = true;
+            if (!ifModifiedSince.empty()) {
+                rewritten.append("If-Modified-Since: ");
+                rewritten.append(ifModifiedSince);
+                rewritten.append("\r\n");
+            }
+            cursor = lineEnd + 2;
+            continue;
+        }
+        rewritten.append(line.data(), line.size());
+        rewritten.append("\r\n");
+        cursor = lineEnd + 2;
+    }
+
+    rewritten.append("Connection: close\r\n");
+    if (!ifModifiedSince.empty() && !hasIfModifiedSince) {
+        rewritten.append("If-Modified-Since: ");
+        rewritten.append(ifModifiedSince);
+        rewritten.append("\r\n");
+    }
+
+    rewritten.append("\r\n");
+    rewritten.append(request.data() + headerEnd + 4, request.size() - headerEnd - 4);
+    return rewritten;
+}
+
+std::string ReadSocketFully(Socket sock) {
+    std::array<char, kMaxSize> buffer{};
+    std::string data;
+    while (true) {
+        const int n = recv(sock, buffer.data(), static_cast<int>(buffer.size()), 0);
+        if (n <= 0) {
+            break;
+        }
+        data.append(buffer.data(), static_cast<std::size_t>(n));
+    }
+    return data;
+}
+
+int ParseStatusCode(const std::string& response) {
+    const auto lineEnd = response.find("\r\n");
+    if (lineEnd == std::string::npos) {
+        return 0;
+    }
+    std::string_view statusLine(response.data(), lineEnd);
+    const auto firstSpace = statusLine.find(' ');
+    if (firstSpace == std::string_view::npos) {
+        return 0;
+    }
+    const auto secondSpace = statusLine.find(' ', firstSpace + 1);
+    const std::string codeText = std::string(
+        statusLine.substr(firstSpace + 1,
+                          (secondSpace == std::string_view::npos ? statusLine.size() : secondSpace) - firstSpace - 1));
+    try {
+        return std::stoi(codeText);
+    } catch (...) {
+        return 0;
+    }
+}
+
+std::string GetHeaderValue(const std::string& message, const std::string& headerName) {
+    const auto firstLineEnd = message.find("\r\n");
+    const auto headerEnd = message.find("\r\n\r\n");
+    if (firstLineEnd == std::string::npos || headerEnd == std::string::npos || firstLineEnd >= headerEnd) {
+        return {};
+    }
+
+    const std::string loweredNeedle = ToLower(headerName);
+    std::size_t cursor = firstLineEnd + 2;
+    while (cursor < headerEnd) {
+        const auto lineEnd = message.find("\r\n", cursor);
+        if (lineEnd == std::string::npos || lineEnd > headerEnd) {
+            break;
+        }
+        std::string_view line(message.data() + cursor, lineEnd - cursor);
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            std::string key = ToLower(std::string(line.substr(0, colon)));
+            if (key == loweredNeedle) {
+                return Trim(line.substr(colon + 1));
+            }
+        }
+        cursor = lineEnd + 2;
+    }
+    return {};
+}
+
+bool IsResponseCacheable(const std::string& response) {
+    if (ParseStatusCode(response) != 200) {
+        return false;
+    }
+    const std::string cacheControl = ToLower(GetHeaderValue(response, "Cache-Control"));
+    if (cacheControl.find("no-store") != std::string::npos) {
+        return false;
+    }
+    return !GetHeaderValue(response, "Last-Modified").empty();
+}
+
+void SaveCache(const std::string& key, std::string response) {
+    if (response.empty() || response.size() > kMaxCacheObjectBytes) {
+        return;
+    }
+
+    const std::string lastModified = GetHeaderValue(response, "Last-Modified");
+    if (lastModified.empty()) {
+        return;
+    }
+
+    CacheEntry entry;
+    entry.lastModified = lastModified;
+    entry.response = std::move(response);
+    entry.storedAt = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(gCacheMutex);
+    if (gHttpCache.size() >= kMaxCacheEntries) {
+        auto oldest = gHttpCache.begin();
+        for (auto it = gHttpCache.begin(); it != gHttpCache.end(); ++it) {
+            if (it->second.storedAt < oldest->second.storedAt) {
+                oldest = it;
+            }
+        }
+        gHttpCache.erase(oldest);
+    }
+    gHttpCache[key] = std::move(entry);
 }
 
 bool SendAll(Socket sock, const char* data, std::size_t len) {
@@ -160,7 +497,7 @@ void Relay(Socket source, Socket target) {
         }
     }
 }
-
+//解析端口，如果用户程序没有指定的话，使用默认的端口，http和https的默认端口不同
 std::pair<std::string, std::uint16_t> SplitHostPort(const std::string& endpoint, std::uint16_t defaultPort) {
     if (endpoint.empty()) {
         return {"", defaultPort};
@@ -217,7 +554,7 @@ Socket ConnectToServer(const std::string& host, std::uint16_t port) {
     return kInvalidSocket;
 }
 
-void HandleClient(Socket clientSocket) {
+void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     SocketGuard client(clientSocket);
     std::array<char, kMaxSize> buffer{};
 
@@ -227,29 +564,47 @@ void HandleClient(Socket clientSocket) {
     }
 
     const std::string request(buffer.data(), static_cast<std::size_t>(recvSize));
+    // std::printf("[debug]现在接收到: %s",request.c_str());
     const HttpHeader header = ParseHttpHead(request);
     const bool isConnect = (header.method == "CONNECT");
 
+    //如果是connect的话优先使用header.url来寻找远端服务器
     const std::string endpoint = isConnect ? header.url : header.host;
+    //解析结果例如[ws.bilibili.com,443]
     const auto [targetHost, targetPort] =
         SplitHostPort(endpoint, isConnect ? kHttpsPort : kHttpPort);
+    const std::string clientIp = ClientIpFromSockaddr(clientAddr);
 
     if (targetHost.empty()) {
         std::cerr << "Missing target host\n";
         return;
     }
 
-    std::printf("Incoming method=%s host=%s url=%s\n",
+    //判断是否应该ban掉用户或者往账
+    if (!clientIp.empty() && !IsUserAllowed(ToLower(clientIp))) {
+        std::cerr << "Blocked user: " << clientIp << "\n";
+        SendSimpleHttpError(client.sock, 403, "Forbidden", "User access denied by proxy policy.");
+        return;
+    }
+    if (!IsSiteAllowed(targetHost)) {
+        std::cerr << "[嘿嘿嘿我不让你访问]: " << targetHost << "\n";
+        SendSimpleHttpError(client.sock, 403, "Forbidden", "Site blocked by proxy policy.");
+        return;
+    }
+
+    std::printf("[debug]接收到一个请求=%s host=%s url=%s\n",
                 header.method.c_str(),
                 header.host.c_str(),
                 header.url.c_str());
 
+    //发现不应该封禁就建立和远程服务器的连接
     SocketGuard server(ConnectToServer(targetHost, targetPort));
     if (server.sock == kInvalidSocket) {
         std::cerr << "Failed to connect target host: " << targetHost << ":" << targetPort << "\n";
         return;
     }
 
+    //如果是connect请求，建立一个隧道就好，直接给客户端返回字符串
     if (isConnect) {
         constexpr const char* kConnectOk = "HTTP/1.1 200 Connection Established\r\n\r\n";
         if (!SendAll(client.sock, kConnectOk, std::strlen(kConnectOk))) {
@@ -257,28 +612,66 @@ void HandleClient(Socket clientSocket) {
         }
 
         std::thread c2s([&]() {
+            //创建一个线程把客户端的数据直接发送到服务端
             Relay(client.sock, server.sock);
             shutdown(server.sock, SD_SEND);
         });
 
+        //主线程继续把服务端的通信转发到客户端
         Relay(server.sock, client.sock);
         shutdown(client.sock, SD_SEND);
         c2s.join();
         return;
     }
+    //标记是不是get方法
+    const bool isGet = (header.method == "GET");
+    //形式是host | url
+    const std::string cacheKey = BuildCacheKey(header);
 
-    if (!SendAll(server.sock, request.data(), request.size())) {
+    CacheEntry cached{};
+    bool hasValidCached = false;
+    if (isGet) {
+        std::lock_guard<std::mutex> lock(gCacheMutex);
+        auto it = gHttpCache.find(cacheKey);
+        //找到本地缓存，并且本地已经标记过他是修改过的
+        if (it != gHttpCache.end() && !it->second.lastModified.empty()) {
+            cached = it->second;
+            hasValidCached = true;
+        }
+    }
+
+    //访问原网站，重新验证缓存
+    std::string outboundRequest = request;
+    if (hasValidCached) {
+        outboundRequest = RewriteProxyRequest(request, cached.lastModified);
+    } else {
+        outboundRequest = RewriteProxyRequest(request, "");
+    }
+    if (!SendAll(server.sock, outboundRequest.data(), outboundRequest.size())) {
         return;
     }
 
-    while (true) {
-        const int upstreamRecv = recv(server.sock, buffer.data(), static_cast<int>(buffer.size()), 0);
-        if (upstreamRecv <= 0) {
-            break;
-        }
-        if (!SendAll(client.sock, buffer.data(), static_cast<std::size_t>(upstreamRecv))) {
-            break;
-        }
+
+    std::string upstreamResponse = ReadSocketFully(server.sock);
+    if (upstreamResponse.empty()) {
+        return;
+    }
+
+    const int statusCode = ParseStatusCode(upstreamResponse);
+    if (hasValidCached && statusCode == 304) {
+        //304说明远程网站没有变换，那么直接给客户端返回本地的缓存
+        SendAll(client.sock, cached.response.data(), cached.response.size());
+        return;
+    }
+
+    //否则返回远程的缓存
+    if (!SendAll(client.sock, upstreamResponse.data(), upstreamResponse.size())) {
+        return;
+    }
+
+    //get方法就保存，post通常比较复杂?
+    if (isGet && IsResponseCacheable(upstreamResponse)) {
+        SaveCache(cacheKey, std::move(upstreamResponse));
     }
 }
 
@@ -321,13 +714,23 @@ int main() {
         return 1;
     }
 
+    if (!EnsureFilterConfigExists(kFilterConfigPath)) {
+        std::cerr << "Failed to create default filter config: " << kFilterConfigPath << "\n";
+        return 1;
+    }
+    if (!LoadFilterConfig(kFilterConfigPath)) {
+        std::cerr << "Failed to load filter config: " << kFilterConfigPath << "\n";
+        return 1;
+    }
+
     SocketGuard proxyServer(InitSocket());
     if (proxyServer.sock == kInvalidSocket) {
         std::cerr << "Failed to initialize proxy socket on port " << kProxyPort << "\n";
         return 1;
     }
 
-    std::cout << "Proxy is listening on port " << kProxyPort << '\n';
+    std::cout << "Proxy is listening on port " << kProxyPort
+              << " with rules from " << kFilterConfigPath << '\n';
 
     while (true) {
         sockaddr_storage clientAddr{};
@@ -338,6 +741,6 @@ int main() {
             continue;
         }
 
-        std::thread([client]() { HandleClient(client); }).detach();
+        std::thread([client, clientAddr]() { HandleClient(client, clientAddr); }).detach();
     }
 }

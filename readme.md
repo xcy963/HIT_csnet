@@ -58,3 +58,30 @@ Header2: ...\r\n
 [原始字节Body，可文本可二进制]
 
 ```
+
+- 一个简单的例子
+```txt
+CONNECT ws.chatgpt.com:443 HTTP/1.1
+Host: ws.chatgpt.com:443
+Proxy-Connection: keep-alive
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0
+
+
+```
+
+## get和post的区别
+
+- get从url传递参数
+```http
+GET /search?q=chatgpt HTTP/1.1
+Host: example.com
+```
+
+- post创建一个json行
+```http
+POST /submit HTTP/1.1
+Host: example.com
+Content-Type: application/json
+
+{"name": "Alice"}
+```
