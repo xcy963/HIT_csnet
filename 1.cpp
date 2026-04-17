@@ -9,8 +9,10 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -41,6 +43,7 @@ constexpr std::uint16_t kProxyPort = 10240;
 constexpr std::size_t kMaxCacheEntries = 128;
 constexpr std::size_t kMaxCacheObjectBytes = 2 * 1024 * 1024;
 constexpr const char* kFilterConfigPath = "proxy_rules.conf";
+constexpr const char* kCacheDirectory = "proxy_cache";
 
 void SetupUtf8Console() {
     SetConsoleOutputCP(CP_UTF8);
@@ -108,6 +111,7 @@ struct CacheEntry {
 struct FilterConfig {
     std::vector<std::string> blockSites;
     std::vector<std::string> blockUsers;
+    std::vector<std::pair<std::string, std::string>> siteRedirects;
 };
 
 //这个缓存信息
@@ -118,6 +122,7 @@ std::unordered_map<std::string, CacheEntry> gHttpCache;
 std::mutex gFilterMutex;
 FilterConfig gFilterConfig;
 bool SendAll(Socket sock, const char* data, std::size_t len);
+std::string GetHeaderValue(const std::string& message, const std::string& headerName);
 
 std::string Trim(std::string_view value) {
     const auto first = value.find_first_not_of(" \t");
@@ -201,9 +206,11 @@ bool EnsureFilterConfigExists(const std::string& path) {
         << "# key=value\n"
         << "# site_block=bad.com\n"
         << "# user_block=10.0.0.8\n"
+        << "# site_redirect=old.example.com,https://new.example.com/\n"
         << "# Supports exact and wildcard pattern\n"
         << "# site_block=*.example.com\n"
-        << "# user_block=192.168.1.*\n";
+        << "# user_block=192.168.1.*\n"
+        << "# site_redirect=*.legacy.com,https://portal.example.com/\n";
     return true;
 }
 
@@ -226,8 +233,9 @@ bool LoadFilterConfig(const std::string& path) {
             continue;
         }
         const std::string key = ToLower(Trim(line.substr(0, eq)));
-        const std::string value = ToLower(Trim(line.substr(eq + 1)));
-        if (value.empty()) {
+        const std::string valueRaw = Trim(line.substr(eq + 1));
+        const std::string value = ToLower(valueRaw);
+        if (valueRaw.empty()) {
             continue;
         }
 
@@ -235,6 +243,17 @@ bool LoadFilterConfig(const std::string& path) {
             cfg.blockSites.push_back(value);
         } else if (key == "user_block") {
             cfg.blockUsers.push_back(value);
+        } else if (key == "site_redirect") {
+            const auto comma = valueRaw.find(',');
+            if (comma == std::string::npos) {
+                continue;
+            }
+            const std::string sourcePattern = ToLower(Trim(valueRaw.substr(0, comma)));
+            const std::string destinationUrl = Trim(valueRaw.substr(comma + 1));
+            if (sourcePattern.empty() || destinationUrl.empty()) {
+                continue;
+            }
+            cfg.siteRedirects.emplace_back(sourcePattern, destinationUrl);
         }
     }
 
@@ -263,9 +282,33 @@ bool IsSiteAllowed(const std::string& host) {
     return IsAllowedByBlockList(normalizedHost, gFilterConfig.blockSites);
 }
 
+//直接重定向
+bool TryFindSiteRedirect(const std::string& host, std::string& location) {
+    const std::string normalizedHost = NormalizeHost(host);
+    std::lock_guard<std::mutex> lock(gFilterMutex);
+    for (const auto& [pattern, target] : gFilterConfig.siteRedirects) {
+        if (MatchPattern(normalizedHost, pattern)) {
+            location = target;
+            return true;
+        }
+    }
+    return false;
+}
+
 void SendSimpleHttpError(Socket sock, int statusCode, const std::string& reason, const std::string& bodyText) {
     const std::string body = bodyText + "\n";
     std::string response = "HTTP/1.1 " + std::to_string(statusCode) + " " + reason + "\r\n";
+    response += "Content-Type: text/plain; charset=utf-8\r\n";
+    response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    response += "Connection: close\r\n\r\n";
+    response += body;
+    SendAll(sock, response.data(), response.size());
+}
+
+void SendRedirectResponse(Socket sock, const std::string& location) {
+    const std::string body = "Redirecting to " + location + "\n";
+    std::string response = "HTTP/1.1 302 Found\r\n";
+    response += "Location: " + location + "\r\n";
     response += "Content-Type: text/plain; charset=utf-8\r\n";
     response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     response += "Connection: close\r\n\r\n";
@@ -318,6 +361,68 @@ HttpHeader ParseHttpHead(const std::string& request) {
 std::string BuildCacheKey(const HttpHeader& header) {
     return header.host + "|" + header.url;
 }
+
+std::uint64_t Fnv1a64(std::string_view value) {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (unsigned char c : value) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string HexU64(std::uint64_t value) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string text(16, '0');
+    for (int i = 15; i >= 0; --i) {
+        text[static_cast<std::size_t>(i)] = kHex[value & 0xF];
+        value >>= 4;
+    }
+    return text;
+}
+
+std::filesystem::path CacheFilePathForKey(const std::string& key) {
+    const std::string fileName = HexU64(Fnv1a64(key)) + ".cache";
+    // const std::string fileName = key + ".cache";
+    return std::filesystem::path(kCacheDirectory) / fileName;
+}
+
+bool EnsureCacheDirectoryExists() {
+    std::error_code ec;
+    if (std::filesystem::exists(kCacheDirectory, ec)) {
+        return !ec;
+    }
+    if (ec) {
+        return false;
+    }
+    return std::filesystem::create_directories(kCacheDirectory, ec) && !ec;
+}
+
+bool WriteCacheToDisk(const std::string& key, const std::string& response) {
+    const std::filesystem::path path = CacheFilePathForKey(key);
+    //trunc：有文件存在先清空
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.good()) {
+        return false;
+    }
+    out.write(response.data(), static_cast<std::streamsize>(response.size()));
+    return out.good();
+}
+
+void PutCacheEntryToMemory(const std::string& key, CacheEntry entry) {
+    std::lock_guard<std::mutex> lock(gCacheMutex);
+    if (gHttpCache.size() >= kMaxCacheEntries) {
+        auto oldest = gHttpCache.begin();
+        for (auto it = gHttpCache.begin(); it != gHttpCache.end(); ++it) {
+            if (it->second.storedAt < oldest->second.storedAt) {
+                oldest = it;
+            }
+        }
+        gHttpCache.erase(oldest);
+    }
+    gHttpCache[key] = std::move(entry);
+}
+
 
 std::string RewriteProxyRequest(const std::string& request, const std::string& ifModifiedSince) {
     const auto headerEnd = request.find("\r\n\r\n");
@@ -386,6 +491,7 @@ std::string ReadSocketFully(Socket sock) {
     return data;
 }
 
+//在第一行，HTTP/1.1 304 Not Modified
 int ParseStatusCode(const std::string& response) {
     const auto lineEnd = response.find("\r\n");
     if (lineEnd == std::string::npos) {
@@ -403,10 +509,11 @@ int ParseStatusCode(const std::string& response) {
     try {
         return std::stoi(codeText);
     } catch (...) {
-        return 0;
+        return -1;
     }
 }
 
+//查询特定的头
 std::string GetHeaderValue(const std::string& message, const std::string& headerName) {
     const auto firstLineEnd = message.find("\r\n");
     const auto headerEnd = message.find("\r\n\r\n");
@@ -460,17 +567,8 @@ void SaveCache(const std::string& key, std::string response) {
     entry.response = std::move(response);
     entry.storedAt = std::chrono::steady_clock::now();
 
-    std::lock_guard<std::mutex> lock(gCacheMutex);
-    if (gHttpCache.size() >= kMaxCacheEntries) {
-        auto oldest = gHttpCache.begin();
-        for (auto it = gHttpCache.begin(); it != gHttpCache.end(); ++it) {
-            if (it->second.storedAt < oldest->second.storedAt) {
-                oldest = it;
-            }
-        }
-        gHttpCache.erase(oldest);
-    }
-    gHttpCache[key] = std::move(entry);
+    WriteCacheToDisk(key, entry.response);
+    PutCacheEntryToMemory(key, std::move(entry));
 }
 
 bool SendAll(Socket sock, const char* data, std::size_t len) {
@@ -485,18 +583,18 @@ bool SendAll(Socket sock, const char* data, std::size_t len) {
     return true;
 }
 
-void Relay(Socket source, Socket target) {
-    std::array<char, kMaxSize> relayBuffer{};
-    while (true) {
-        const int n = recv(source, relayBuffer.data(), static_cast<int>(relayBuffer.size()), 0);
-        if (n <= 0) {
-            break;
-        }
-        if (!SendAll(target, relayBuffer.data(), static_cast<std::size_t>(n))) {
-            break;
-        }
-    }
-}
+// void Relay(Socket source, Socket target) {
+//     std::array<char, kMaxSize> relayBuffer{};
+//     while (true) {
+//         const int n = recv(source, relayBuffer.data(), static_cast<int>(relayBuffer.size()), 0);
+//         if (n <= 0) {
+//             break;
+//         }
+//         if (!SendAll(target, relayBuffer.data(), static_cast<std::size_t>(n))) {
+//             break;
+//         }
+//     }
+// }
 //解析端口，如果用户程序没有指定的话，使用默认的端口，http和https的默认端口不同
 std::pair<std::string, std::uint16_t> SplitHostPort(const std::string& endpoint, std::uint16_t defaultPort) {
     if (endpoint.empty()) {
@@ -580,7 +678,7 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
         return;
     }
 
-    //判断是否应该ban掉用户或者往账
+    //判断是否应该ban掉用户或网站
     if (!clientIp.empty() && !IsUserAllowed(ToLower(clientIp))) {
         std::cerr << "Blocked user: " << clientIp << "\n";
         SendSimpleHttpError(client.sock, 403, "Forbidden", "User access denied by proxy policy.");
@@ -598,6 +696,16 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
                 header.url.c_str());
 
     //发现不应该封禁就建立和远程服务器的连接
+    if (!isConnect) {
+        std::string redirectLocation;
+        if (TryFindSiteRedirect(targetHost, redirectLocation)) {
+            std::cerr << "Redirect " << targetHost << " -> " << redirectLocation << "\n";
+            //向着客户端发送信息
+            SendRedirectResponse(client.sock, redirectLocation);
+            return;
+        }
+    }
+
     SocketGuard server(ConnectToServer(targetHost, targetPort));
     if (server.sock == kInvalidSocket) {
         std::cerr << "Failed to connect target host: " << targetHost << ":" << targetPort << "\n";
@@ -605,24 +713,31 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     }
 
     //如果是connect请求，建立一个隧道就好，直接给客户端返回字符串
+    //connect需要先禁止，不然不能缓存
     if (isConnect) {
-        constexpr const char* kConnectOk = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        if (!SendAll(client.sock, kConnectOk, std::strlen(kConnectOk))) {
-            return;
-        }
+        // constexpr const char* kConnectOk = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        // if (!SendAll(client.sock, kConnectOk, std::strlen(kConnectOk))) {
+        //     return;
+        // }
 
-        std::thread c2s([&]() {
-            //创建一个线程把客户端的数据直接发送到服务端
-            Relay(client.sock, server.sock);
-            shutdown(server.sock, SD_SEND);
-        });
+        // std::thread c2s([&]() {
+        //     //创建一个线程把客户端的数据直接发送到服务端
+        //     Relay(client.sock, server.sock);
+        //     shutdown(server.sock, SD_SEND);
+        // });
 
-        //主线程继续把服务端的通信转发到客户端
-        Relay(server.sock, client.sock);
-        shutdown(client.sock, SD_SEND);
-        c2s.join();
+        // //主线程继续把服务端的通信转发到客户端
+        // Relay(server.sock, client.sock);
+        // shutdown(client.sock, SD_SEND);
+        // c2s.join();
         return;
     }
+    // std::printf("[debug]现在接收到:\n %s\n",request.c_str());
+
+    // std::printf("[debug]接收到一个请求=%s host=%s url=%s\n",
+    //         header.method.c_str(),
+    //         header.host.c_str(),
+    //         header.url.c_str());
     //标记是不是get方法
     const bool isGet = (header.method == "GET");
     //形式是host | url
@@ -631,20 +746,24 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     CacheEntry cached{};
     bool hasValidCached = false;
     if (isGet) {
-        std::lock_guard<std::mutex> lock(gCacheMutex);
-        auto it = gHttpCache.find(cacheKey);
+        {
+            std::lock_guard<std::mutex> lock(gCacheMutex);
+            auto it = gHttpCache.find(cacheKey);
         //找到本地缓存，并且本地已经标记过他是修改过的
         if (it != gHttpCache.end() && !it->second.lastModified.empty()) {
             cached = it->second;
             hasValidCached = true;
+        }
         }
     }
 
     //访问原网站，重新验证缓存
     std::string outboundRequest = request;
     if (hasValidCached) {
+        std::cout<<"本地现在有缓存"<<std::endl;
         outboundRequest = RewriteProxyRequest(request, cached.lastModified);
     } else {
+        std::cout<<"找不到缓存"<<std::endl;
         outboundRequest = RewriteProxyRequest(request, "");
     }
     if (!SendAll(server.sock, outboundRequest.data(), outboundRequest.size())) {
@@ -656,7 +775,7 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     if (upstreamResponse.empty()) {
         return;
     }
-
+    // std::printf("[debug]远程返回: \n%s\n",upstreamResponse.c_str());
     const int statusCode = ParseStatusCode(upstreamResponse);
     if (hasValidCached && statusCode == 304) {
         //304说明远程网站没有变换，那么直接给客户端返回本地的缓存
@@ -670,7 +789,7 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     }
 
     //get方法就保存，post通常比较复杂?
-    if (isGet && IsResponseCacheable(upstreamResponse)) {
+    if (IsResponseCacheable(upstreamResponse)) {
         SaveCache(cacheKey, std::move(upstreamResponse));
     }
 }
@@ -720,6 +839,10 @@ int main() {
     }
     if (!LoadFilterConfig(kFilterConfigPath)) {
         std::cerr << "Failed to load filter config: " << kFilterConfigPath << "\n";
+        return 1;
+    }
+    if (!EnsureCacheDirectoryExists()) {
+        std::cerr << "Failed to create cache directory: " << kCacheDirectory << "\n";
         return 1;
     }
 
