@@ -426,9 +426,11 @@ void PutCacheEntryToMemory(const std::string& key, CacheEntry entry) {
 
 std::string RewriteProxyRequest(const std::string& request, const std::string& ifModifiedSince) {
     const auto headerEnd = request.find("\r\n\r\n");
+    //找不到header end，就直接返回
     if (headerEnd == std::string::npos) {
         return request;
     }
+    //找不到第一行也返回
     const auto firstLineEnd = request.find("\r\n");
     if (firstLineEnd == std::string::npos || firstLineEnd > headerEnd) {
         return request;
@@ -699,7 +701,7 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     if (!isConnect) {
         std::string redirectLocation;
         if (TryFindSiteRedirect(targetHost, redirectLocation)) {
-            std::cerr << "Redirect " << targetHost << " -> " << redirectLocation << "\n";
+            std::cerr << "[上钩！] Redirect " << targetHost << " -> " << redirectLocation << "\n";
             //向着客户端发送信息
             SendRedirectResponse(client.sock, redirectLocation);
             return;
@@ -778,7 +780,7 @@ void HandleClient(Socket clientSocket, const sockaddr_storage& clientAddr) {
     // std::printf("[debug]远程返回: \n%s\n",upstreamResponse.c_str());
     const int statusCode = ParseStatusCode(upstreamResponse);
     if (hasValidCached && statusCode == 304) {
-        //304说明远程网站没有变换，那么直接给客户端返回本地的缓存
+        //304说明远程网站没有变化，那么直接给客户端返回本地的缓存
         SendAll(client.sock, cached.response.data(), cached.response.size());
         return;
     }
