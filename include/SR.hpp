@@ -65,7 +65,9 @@ inline bool sendDataPacket(
     const std::vector<char>& data,
     int totalPacket,
     int pktIndex,
-    const char* logPrefix
+    const char* logPrefix,
+    bool isRetrans = false,
+    int retry = 0
 ) {
     int offset = pktIndex * kPayloadSize;
     int left = static_cast<int>(data.size()) - offset;
@@ -94,21 +96,25 @@ inline bool sendDataPacket(
     if (logPrefix != nullptr) {
         if (dropped) {
             printf(
-                "[%s] DROP pkt=%d/%d seq=%d bytes=%d (simulated loss)\n",
+                "[%s] %s pkt=%d/%d seq=%d bytes=%d%s\n",
                 logPrefix,
+                isRetrans ? "RDROP" : "DROP",
                 pktIndex + 1,
                 totalPacket,
                 seq,
-                payloadLen
+                payloadLen,
+                isRetrans ? " (retransmission loss)" : " (simulated loss)"
             );
         } else {
             printf(
-                "[%s] SEND pkt=%d/%d seq=%d bytes=%d\n",
+                "[%s] %s pkt=%d/%d seq=%d bytes=%d%s\n",
                 logPrefix,
+                isRetrans ? "RTX " : "SEND",
                 pktIndex + 1,
                 totalPacket,
                 seq,
-                payloadLen
+                payloadLen,
+                isRetrans ? " (retransmission)" : ""
             );
         }
     }
@@ -146,7 +152,7 @@ inline bool sendBuffer(
     while (base < totalPacket) {
         //发送整个窗口
         while (next < totalPacket && next < base + kSendWindowSize) {
-            sendDataPacket(sock, peer, data, totalPacket, next, logPrefix);
+            sendDataPacket(sock, peer, data, totalPacket, next, logPrefix, false, 0);
             sent[next] = true;
             lastSendTick[next] = GetTickCount();
             ++next;
@@ -179,16 +185,16 @@ inline bool sendBuffer(
         while (base < totalPacket && acked[base]) {
             ++base;
         }
-
+        //对窗口里面的包再次发送
         DWORD now = GetTickCount();
         for (int i = base; i < next; ++i) {
             if (sent[i] && !acked[i] && now - lastSendTick[i] > kPacketTimeoutMs) {
-                sendDataPacket(sock, peer, data, totalPacket, i, logPrefix);
+                sendDataPacket(sock, peer, data, totalPacket, i, logPrefix, true, retryCount[i] + 1);
                 lastSendTick[i] = now;
                 ++retryCount[i];
                 ++timeoutEvents;
                 if (logPrefix != nullptr) {
-                    printf("[%s] RTO  pkt=%d retry=%d\n", logPrefix, i + 1, retryCount[i]);
+                    printf("[%s] RTO  pkt=%d retry=%d (retransmitting this packet only)\n", logPrefix, i + 1, retryCount[i]);
                 }
                 if (retryCount[i] > 200 || timeoutEvents > 2000) {
                     if (logPrefix != nullptr) {

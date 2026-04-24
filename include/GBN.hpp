@@ -201,9 +201,21 @@ inline bool sendBuffer(
                 }
             }
         } else {
+            int oldBase = curAck;
             int ackSeq = ackHandler(static_cast<unsigned char>(recvBuf[0]), curAck, ack);
             if (ackSeq >= 0 && logPrefix != nullptr) {
-                printf("[%s] ACK  seq=%d new_base=%d\n", logPrefix, ackSeq, curAck);
+                if (curAck == oldBase) {
+                    int lastInOrder = (curAck - 1 + kSeqSize) % kSeqSize;
+                    printf(
+                        "[%s] DUPACK seq=%d (client in-order up to seq=%d), waiting seq=%d\n",
+                        logPrefix,
+                        ackSeq,
+                        lastInOrder,
+                        curAck
+                    );
+                } else {
+                    printf("[%s] ACK  seq=%d new_base=%d\n", logPrefix, ackSeq, curAck);
+                }
             }
             waitCount = 0;
             timeoutEvents = 0;
@@ -291,6 +303,7 @@ inline bool receiveBuffer(
 
             if (logPrefix != nullptr) {
                 printf("[%s] RECV seq=%d bytes=%d total=%zu/%zu\n", logPrefix, seq, payloadLen, out.size(), expectedBytes);
+                printf("[%s] ACK  send ack=%d (next expected=%d)\n", logPrefix, seq, expectedSeq);
             }
         } else {
             if (lastAckedSeq >= 0) {
@@ -303,6 +316,17 @@ inline bool receiveBuffer(
                     reinterpret_cast<const SOCKADDR*>(&peer),
                     sizeof(SOCKADDR)
                 );
+                if (logPrefix != nullptr) {
+                    printf(
+                        "[%s] OOO  got seq=%d but expected=%d, resend ack=%d\n",
+                        logPrefix,
+                        seq,
+                        expectedSeq,
+                        lastAckedSeq
+                    );
+                }
+            } else if (logPrefix != nullptr) {
+                printf("[%s] OOO  got seq=%d but expected=%d, no ack yet\n", logPrefix, seq, expectedSeq);
             }
         }
     }
