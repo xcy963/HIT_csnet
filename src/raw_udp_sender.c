@@ -14,6 +14,10 @@
 
 #define BUFSIZE 1518
 
+/*
+实现第二个部分的内容,从底层封装网络帧
+*/
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: sudo %s <iface> <dst_mac> <src_ip> <dst_ip> <src_port> <dst_port> [message]\n"
@@ -26,17 +30,22 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-
+    //解析网卡名字
     const char *iface = argv[1];
+    //解析目的地址的mac 00:0c:29:aa:bb:cc会变成6个字节
+    //mac在定义上是标识网卡的
     uint8_t dst_mac[MAC_LEN];
     if (parse_mac(argv[2], dst_mac) != 0) {
         fprintf(stderr, "Invalid dst_mac: %s\n", argv[2]);
         return 1;
     }
+
+    //解析ip地址,ip其实对应的是32的整型
     uint32_t src_ip = parse_ipv4_or_die(argv[3]);
     uint32_t dst_ip = parse_ipv4_or_die(argv[4]);
     int src_port = atoi(argv[5]);
     int dst_port = atoi(argv[6]);
+
     const char *msg = (argc == 8) ? argv[7] : "Hello, this is a test message.";
     size_t msg_len = strlen(msg);
 
@@ -44,7 +53,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Message too long for this simple Ethernet frame example\n");
         return 1;
     }
-
+    //创建socket 
+    //AF_PACKET: 以太网帧
     int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sockfd < 0) {
         perror("socket(AF_PACKET)");

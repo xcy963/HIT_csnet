@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,16 @@
 
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s <listen_port>\n", prog);
+}
+//构造时间的函数
+static void now_str(char *out, size_t out_sz) {
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    if (tm_now == NULL) {
+        snprintf(out, out_sz, "time_error");
+        return;
+    }
+    strftime(out, out_sz, "%F %T", tm_now);
 }
 
 int main(int argc, char **argv) {
@@ -56,6 +67,9 @@ int main(int argc, char **argv) {
         buf[n] = '\0';
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
-        printf("Received %zd bytes from %s:%u: %s\n", n, src_ip, ntohs(src.sin_port), buf);
+        char ts[32];
+        //添加显示时间的逻辑
+        now_str(ts, sizeof(ts));
+        printf("[%s] Received %zd bytes from %s:%u: %s\n", ts, n, src_ip, ntohs(src.sin_port), buf);
     }
 }

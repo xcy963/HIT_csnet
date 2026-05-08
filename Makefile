@@ -10,7 +10,7 @@ DOCKER_IMAGE := ubuntu:22.04
 DOCKER_NET := hitcsnet_lan
 DOCKER_SUBNET := 172.30.0.0/24
 
-.PHONY: all clean run-help docker-net vm1 vm2 vm3 vm4 vm5 vm-clean
+.PHONY: all clean run-help docker-net vm1 vm2 vm3 vm4 vm5 vm-clean abc-run
 
 all: $(BIN_DIR) $(TARGETS)
 
@@ -45,6 +45,7 @@ run-help:
 	@echo "Task 5.3 router:     sudo ./bin/raw_router_twoiface eth0 192.168.1.0/24 <host1_mac> eth1 192.168.2.0/24 <host2_mac>"
 	@echo "Docker LAN net:      make docker-net"
 	@echo "Docker vm1..vm5:     make vm1   (or vm2/vm3/vm4/vm5 in separate terminals)"
+	@echo "Docker A/B/C run:    make abc-run"
 	@echo "Docker cleanup:      make vm-clean"
 
 clean:
@@ -76,4 +77,20 @@ vm5: docker-net
 
 vm-clean:
 	@docker rm -f vm1 vm2 vm3 vm4 vm5 >/dev/null 2>&1 || true
+	@docker rm -f host-a host-b host-c >/dev/null 2>&1 || true
 	@docker network rm $(DOCKER_NET) >/dev/null 2>&1 || true
+
+abc-run: all docker-net
+	@docker rm -f host-a host-b host-c >/dev/null 2>&1 || true
+	@if command -v gnome-terminal >/dev/null 2>&1; then \
+		gnome-terminal -- bash -lc "docker run --rm -it --name host-c --hostname c --network $(DOCKER_NET) --ip 172.30.0.21 -v '$(CURDIR)':/work -w /work $(DOCKER_IMAGE) ./bin/udp_receiver 54321; echo; echo '[c exited] Press Enter to close'; read _"; \
+		gnome-terminal -- bash -lc "docker run --rm -it --name host-b --hostname b --network $(DOCKER_NET) --ip 172.30.0.22 -v '$(CURDIR)':/work -w /work $(DOCKER_IMAGE) ./bin/udp_forwarder 12345 172.30.0.21 54321; echo; echo '[b exited] Press Enter to close'; read _"; \
+		gnome-terminal -- bash -lc "docker run --rm -it --name host-a --hostname a --network $(DOCKER_NET) --ip 172.30.0.23 -v '$(CURDIR)':/work -w /work $(DOCKER_IMAGE) ./bin/udp_sender 172.30.0.22 12345; echo; echo '[a exited] Press Enter to close'; read _"; \
+	elif command -v xterm >/dev/null 2>&1; then \
+		xterm -T c -e bash -lc "docker run --rm -it --name host-c --hostname c --network $(DOCKER_NET) --ip 172.30.0.21 -v '$(CURDIR)':/work -w /work $(DOCKER_IMAGE) ./bin/udp_receiver 54321; echo; echo '[c exited] Press Enter to close'; read _" & \
+		xterm -T b -e bash -lc "docker run --rm -it --name host-b --hostname b --network $(DOCKER_NET) --ip 172.30.0.22 -v '$(CURDIR)':/work -w /work $(DOCKER_IMAGE) ./bin/udp_forwarder 12345 172.30.0.21 54321; echo; echo '[b exited] Press Enter to close'; read _" & \
+		xterm -T a -e bash -lc "docker run --rm -it --name host-a --hostname a --network $(DOCKER_NET) --ip 172.30.0.23 -v '$(CURDIR)':/work -w /work $(DOCKER_IMAGE) ./bin/udp_sender 172.30.0.22 12345; echo; echo '[a exited] Press Enter to close'; read _" & \
+	else \
+		echo "No supported terminal found. Please install gnome-terminal or xterm."; \
+		exit 1; \
+	fi

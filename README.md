@@ -61,6 +61,11 @@ sudo ufw allow 54321/udp
 
 ## 4. 任务 5.2：基于单网口主机的 IP 数据报转发
 
+对应的原始代码
+- src/raw_udp_sender.c  构造完整以太网帧/IP包/UDP包并发送,原来的发送程序
+- src/raw_router_oneiface.c     原来的转发程序升级版本
+- src/udp_receiver.c            直接复用原来的接收程序
+
 该任务使用 `AF_PACKET` 原始套接字，需要 root 权限。
 
 示例拓扑：源主机、路由主机、目的主机在同一个二层网络中。源主机发出的 IP 目的地址是目的主机 IP，但以太网目的 MAC 可以先指向路由主机 MAC；路由主机收到后修改 TTL、重算 IP 头校验和、改写以太网源/目的 MAC，并转发给目的主机。

@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,16 @@
 
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s <listen_port> <dest_ip> <dest_port>\n", prog);
+}
+
+static void now_str(char *out, size_t out_sz) {
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    if (tm_now == NULL) {
+        snprintf(out, out_sz, "time_error");
+        return;
+    }
+    strftime(out, out_sz, "%F %T", tm_now);
 }
 
 int main(int argc, char **argv) {
@@ -80,10 +91,17 @@ int main(int argc, char **argv) {
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
 
-        // 打印从谁发送,然后端口号也在这里了
-        printf("Received %zd bytes from %s:%u, forwarding...\n", n, src_ip, ntohs(src.sin_port));
+        char ts[32];
+        now_str(ts, sizeof(ts));
+        printf("[%s] Received %zd bytes from %s:%u: %.*s\n",
+               ts, n, src_ip, ntohs(src.sin_port), (int)n, buf);
+
         if (sendto(sockfd, buf, (size_t)n, 0, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
             perror("sendto");
+        } else {
+            now_str(ts, sizeof(ts));
+            printf("[%s] Forwarded %zd bytes to %s:%d: %.*s\n",
+                   ts, n, dest_ip, dest_port, (int)n, buf);
         }
     }
 }
