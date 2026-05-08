@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
     printf("UDP sender ready: destination %s:%d\n", dest_ip, dest_port);
     printf("Input one message per line, Ctrl+D to exit.\n");
     while (1) {
+        //获取输入内容
         char buf[BUFSIZE];
         if (fgets(buf, sizeof(buf), stdin) == NULL) {
             break;

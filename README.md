@@ -63,7 +63,7 @@ sudo ufw allow 54321/udp
 
 对应的原始代码
 - src/raw_udp_sender.c  构造完整以太网帧/IP包/UDP包并发送,原来的发送程序
-- src/raw_router_oneiface.c     原来的转发程序升级版本
+- src/raw_router_oneiface.c     原来的转发程序升级版本,这里其实是模拟路由器
 - src/udp_receiver.c            直接复用原来的接收程序
 
 该任务使用 `AF_PACKET` 原始套接字，需要 root 权限。

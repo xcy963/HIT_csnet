@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
 
         ip->ttl -= 1;
         ip->check = 0;
-        ip->check = ip_checksum(ip, (size_t)ip->ihl * 4);
+        ip->check = htons(ip_checksum(ip, (size_t)ip->ihl * 4));
         memcpy(eth->h_dest, route->next_mac, MAC_LEN);
         memcpy(eth->h_source, route->iface_mac, MAC_LEN);
 

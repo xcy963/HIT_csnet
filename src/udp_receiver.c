@@ -23,6 +23,8 @@ static void now_str(char *out, size_t out_sz) {
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     if (argc != 2) {
         usage(argv[0]);
         return 1;
@@ -71,5 +73,7 @@ int main(int argc, char **argv) {
         //添加显示时间的逻辑
         now_str(ts, sizeof(ts));
         printf("[%s] Received %zd bytes from %s:%u: %s\n", ts, n, src_ip, ntohs(src.sin_port), buf);
+        //刷新以下日志,不然有时候没有给\0,日志不刷新
+        fflush(stdout);
     }
 }
