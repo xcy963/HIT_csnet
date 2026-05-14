@@ -29,11 +29,11 @@ int main(int argc, char **argv) {
     int listen_port = DEFAULT_LISTEN_PORT;
     const char *dest_ip = DEFAULT_DEST_IP;
     int dest_port = DEFAULT_DEST_PORT;
-    if (argc == 4) {
-        listen_port = atoi(argv[1]);
-        dest_ip = argv[2];
-        dest_port = atoi(argv[3]);
-    }
+    // if (argc == 4) {
+    //     listen_port = atoi(argv[1]);
+    //     dest_ip = argv[2];
+    //     dest_port = atoi(argv[3]);
+    // }
 
     //创建第一个socket,作为一个文件提供给程序访问
     //AF_INET: ipv4
