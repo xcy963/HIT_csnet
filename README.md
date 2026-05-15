@@ -28,12 +28,8 @@ Makefile                      一键编译脚本
 ```
 
 
-## 四个验收命令（对应四部分）
-
-1. 内容1+2（UDP多主机收发与改进）：`make abc-run`
-2. 内容3（单网口原始套接字转发）：`make abc-run2`
-3. 内容4（不少于5主机，查表转发）：`make abc-run4`
-4. 内容5+6（双网口跨网段转发+双向通信）：`make abc-run3`
-
-> 建议每次切换实验前先执行 `make env-clean`，清理旧容器和网络。
+## 对应的mac查询指令
+```bash
+ip addr show
+```
 

@@ -27,12 +27,14 @@
 
 /*
 实现第二个部分的内容,从底层封装网络帧
+
+注意:这里把数据发送给路由的时候使用的是mac地址
 */
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: sudo %s <iface> <dst_mac> <src_ip> <dst_ip> <src_port> <dst_port> [message] [interval_ms] [count]\n"
-            "Example: sudo %s ens33 00:0c:29:aa:bb:cc 192.168.1.2 192.168.1.3 12345 12345 hello 1000 1\n",
+            "Usage: sudo %s [iface dst_mac src_ip dst_ip src_port dst_port [message] [interval_ms] [count]]\n"
+            "Example: sudo %s eth0 02:42:ac:1e:00:32 192.168.1.1 192.168.1.3 12345 12345 hello 1000 1\n",
             prog, prog);
 }
 
@@ -87,6 +89,7 @@ static uint16_t udp_checksum_ipv4(uint32_t src_ip_be, uint32_t dst_ip_be,
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    // printf("测试以下这个");
 
     const char *iface = DEFAULT_IFACE;
     //解析目的地址的mac 00:0c:29:aa:bb:cc会变成6个字节
@@ -101,7 +104,11 @@ int main(int argc, char **argv) {
     int interval_ms = DEFAULT_INTERVAL_MS;
     int count = DEFAULT_COUNT;
 
-    if (argc >= 7 && argc <= 10) {
+    if (argc != 1 && (argc < 7 || argc > 10)) {
+        usage(argv[0]);
+        return 1;
+    }
+    if (argc >= 7) {
         iface = argv[1];
         dst_mac_text = argv[2];
         src_ip_text = argv[3];
@@ -110,7 +117,7 @@ int main(int argc, char **argv) {
         dst_port = atoi(argv[6]);
         msg = (argc >= 8) ? argv[7] : DEFAULT_MESSAGE;
         interval_ms = (argc >= 9) ? atoi(argv[8]) : DEFAULT_INTERVAL_MS;
-        count = (argc >= 10) ? atoi(argv[9]) : -1;
+        count = (argc >= 10) ? atoi(argv[9]) : DEFAULT_COUNT;
     }
 
     if (parse_mac(dst_mac_text, dst_mac) != 0) {
@@ -130,6 +137,8 @@ int main(int argc, char **argv) {
     if (count == 0 || count < -1) {
         fprintf(stderr, "count must be -1 (infinite) or a positive integer\n");
         return 1;
+    } else {
+        printf("Will send %d packet(s)\n", count);
     }
 
     if (msg_len > 1400) {
@@ -156,7 +165,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    //帧缓冲区域
+    //帧缓冲区域,从这里开始构建数据帧
     unsigned char frame[BUFSIZE];
     memset(frame, 0, sizeof(frame));
 
@@ -171,6 +180,7 @@ int main(int argc, char **argv) {
 
 
     //把frame的地址区域映射为ethhdr,设置以太网头
+    //这一步设置mac地址,这个会导致数据包直接发送到路由器上面
     struct ethhdr *eth = (struct ethhdr *)frame;
     memcpy(eth->h_dest, dst_mac, MAC_LEN);
     memcpy(eth->h_source, src_mac, MAC_LEN);
@@ -258,6 +268,8 @@ int main(int argc, char **argv) {
             nanosleep(&req, NULL);
         }
     }
+
+
 
     close(sockfd);
     return 0;

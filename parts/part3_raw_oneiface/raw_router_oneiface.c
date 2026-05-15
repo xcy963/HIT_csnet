@@ -51,8 +51,8 @@ static void now_str(char out[32]) {
 }
 
 static int debug_enabled(void) {
-
-    return 0;
+    const char *v = getenv("ROUTER_DEBUG");
+    return v != NULL && *v != '\0' && strcmp(v, "0") != 0;
 }
 
 int main(int argc, char **argv) {
@@ -60,6 +60,10 @@ int main(int argc, char **argv) {
     const char *match_src_text = DEFAULT_MATCH_SRC_IP;
     const char *match_dst_text = DEFAULT_MATCH_DST_IP;
     const char *next_mac_text = DEFAULT_NEXT_HOP_MAC;
+    if (argc != 1 && argc != 5) {
+        usage(argv[0]);
+        return 1;
+    }
     if (argc == 5) {
         iface = argv[1];
         match_src_text = argv[2];
@@ -163,6 +167,16 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (memcmp(eth->h_dest, iface_mac, MAC_LEN) != 0) {
+            if (debug_enabled()) {
+                char got_dst_mac[18], want_dst_mac[18];
+                mac_to_str(eth->h_dest, got_dst_mac);
+                mac_to_str(iface_mac, want_dst_mac);
+                printf("[DEBUG] Drop: dst MAC mismatch got %s, want %s\n",
+                       got_dst_mac, want_dst_mac);
+            }
+            continue;
+        }
 
         struct iphdr *ip = (struct iphdr *)(buf + sizeof(struct ethhdr));
         if (ip->version != 4 || ip->ihl < 5) {
@@ -172,7 +186,6 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        //打印日志
         char ts[32];
         char src_mac_str[18], dst_mac_str[18];
         char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
@@ -181,19 +194,13 @@ int main(int argc, char **argv) {
         mac_to_str(eth->h_dest, dst_mac_str);
         ip_to_str(ip->saddr, src_ip);
         ip_to_str(ip->daddr, dst_ip);
-        printf("[%s] RX IPv4: MAC %s -> %s, IP %s -> %s, TTL=%u\n",
-               ts, src_mac_str, dst_mac_str, src_ip, dst_ip, ip->ttl);
-
         if (ip->saddr != match_src || ip->daddr != match_dst) {
             if (debug_enabled()) {
-                char got_src[INET_ADDRSTRLEN], got_dst[INET_ADDRSTRLEN];
                 char want_src[INET_ADDRSTRLEN], want_dst[INET_ADDRSTRLEN];
-                ip_to_str(ip->saddr, got_src);
-                ip_to_str(ip->daddr, got_dst);
                 ip_to_str(match_src, want_src);
                 ip_to_str(match_dst, want_dst);
                 printf("[DEBUG] Drop: IP mismatch got %s -> %s, want %s -> %s\n",
-                       got_src, got_dst, want_src, want_dst);
+                       src_ip, dst_ip, want_src, want_dst);
             }
             continue;
         }
@@ -201,6 +208,9 @@ int main(int argc, char **argv) {
             printf("Drop packet: TTL expired\n");
             continue;
         }
+
+        printf("[%s] RX IPv4: MAC %s -> %s, IP %s -> %s, TTL=%u\n",
+               ts, src_mac_str, dst_mac_str, src_ip, dst_ip, ip->ttl);
 
         uint8_t old_ttl = ip->ttl;
 

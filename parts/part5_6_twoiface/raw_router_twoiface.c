@@ -37,13 +37,13 @@ typedef struct {
     uint32_t mask_be;
 } route_t;
 
-static void usage(const char *prog) {
-    fprintf(stderr,
-            "Usage: sudo %s <iface1> <cidr1> <next_mac1> <iface2> <cidr2> <next_mac2>\n"
-            "Example: sudo %s eth0 192.168.1.0/24 00:0c:29:11:22:33 eth1 192.168.2.0/24 00:0c:29:44:55:66\n"
-            "next_mac is the destination host MAC on that directly connected network.\n",
-            prog, prog);
-}
+// static void usage(const char *prog) {
+//     fprintf(stderr,
+//             "Usage: sudo %s <iface1> <cidr1> <next_mac1> <iface2> <cidr2> <next_mac2>\n"
+//             "Example: sudo %s eth0 192.168.1.0/24 00:0c:29:11:22:33 eth1 192.168.2.0/24 00:0c:29:44:55:66\n"
+//             "next_mac is the destination host MAC on that directly connected network.\n",
+//             prog, prog);
+// }
 
 static void ip_to_str(uint32_t ip_be, char out[INET_ADDRSTRLEN]) {
     struct in_addr a;
@@ -86,6 +86,7 @@ int main(int argc, char **argv) {
     const char *cidr2 = DEFAULT_CIDR2;
     const char *next2 = DEFAULT_NEXT_MAC2;
 
+    //因为这个路由程序是需要复用的,所以还是读一点参数进来好
     if (argc == 7) {
         iface1 = argv[1];
         cidr1 = argv[2];
@@ -114,7 +115,7 @@ int main(int argc, char **argv) {
     memset(routes, 0, sizeof(routes));
     routes[0].iface = iface1;
     routes[1].iface = iface2;
-//192.168.1.0/24 解析
+    //192.168.1.0/24 解析
 
     if (parse_cidr(cidr1, &routes[0].network_be, &routes[0].mask_be) != 0 ||
         parse_cidr(cidr2, &routes[1].network_be, &routes[1].mask_be) != 0) {

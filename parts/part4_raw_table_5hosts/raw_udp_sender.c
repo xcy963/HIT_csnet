@@ -16,9 +16,9 @@
 
 #define BUFSIZE 1518
 #define DEFAULT_IFACE "eth0"
-#define DEFAULT_DST_MAC "02:42:ac:1e:00:32"
+#define DEFAULT_DST_MAC "02:42:ac:1e:00:42"
 #define DEFAULT_SRC_IP "192.168.1.1"
-#define DEFAULT_DST_IP "192.168.1.3"
+#define DEFAULT_DST_IP "192.168.1.5"
 #define DEFAULT_SRC_PORT 12345
 #define DEFAULT_DST_PORT 12345
 #define DEFAULT_MESSAGE "Hello, this is a test message."

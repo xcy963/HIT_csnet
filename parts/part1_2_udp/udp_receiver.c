@@ -27,9 +27,9 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     int port = DEFAULT_LISTEN_PORT;
-    if (argc == 2) {
-        port = atoi(argv[1]);
-    }
+    // if (argc == 2) {
+    //     port = atoi(argv[1]);
+    // }
 
     //设置socket
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
             perror("recvfrom");
             continue;
         }
-        //设置字符串结尾,不然会有很多0
+        //设置字符串结尾,不然会有很多0(ascii的0)
         buf[n] = '\0';
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));

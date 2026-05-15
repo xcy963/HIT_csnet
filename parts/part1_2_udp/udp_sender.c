@@ -15,9 +15,9 @@
 向某一个ip地址和端口发送对应的数据
 */
 
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <dest_ip> <dest_port>\n", prog);
-}
+// static void usage(const char *prog) {
+//     fprintf(stderr, "Usage: %s <dest_ip> <dest_port>\n", prog);
+// }
 
 static void now_str(char *out, size_t out_sz) {
     time_t now = time(NULL);
@@ -32,10 +32,10 @@ static void now_str(char *out, size_t out_sz) {
 int main(int argc, char **argv) {
     const char *dest_ip = DEFAULT_DEST_IP;
     int dest_port = DEFAULT_DEST_PORT;
-    if (argc == 3) {
-        dest_ip = argv[1];
-        dest_port = atoi(argv[2]);
-    }
+    // if (argc == 3) {
+    //     dest_ip = argv[1];
+    //     dest_port = atoi(argv[2]);
+    // }
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -47,6 +47,8 @@ int main(int argc, char **argv) {
     memset(&dest_addr, 0, sizeof(dest_addr));
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons((uint16_t)dest_port);
+
+    //设置对应的ip 地址
     if (inet_pton(AF_INET, dest_ip, &dest_addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid dest_ip: %s\n", dest_ip);
         close(sockfd);

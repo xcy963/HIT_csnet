@@ -15,7 +15,6 @@
 #define BUFSIZE 65536
 #define MAX_ROUTES 256
 #define DEFAULT_IFACE "eth0"
-#define DEFAULT_ROUTE_FILE "/tmp/route.tbl"
 
 struct route_entry {
     uint32_t dst_ip_be;
@@ -24,10 +23,9 @@ struct route_entry {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: sudo %s <iface> <route_table_file>\n"
-            "Route format (one per line): <dst_ip> <next_hop_mac>\n"
-            "Example line: 192.168.1.5 02:42:ac:1e:00:45\n",
-            prog);
+            "Usage: sudo %s <iface> <dst_ip> <next_hop_mac> [<dst_ip> <next_hop_mac> ...]\n"
+            "Example: sudo %s eth0 192.168.1.5 02:42:ac:1e:00:45\n",
+            prog, prog);
 }
 
 static void now_str(char out[32]) {
@@ -51,58 +49,14 @@ static void mac_to_str(const uint8_t mac[MAC_LEN], char out[18]) {
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-static void trim(char *s) {
-    size_t n = strlen(s);
-    while (n > 0 && isspace((unsigned char)s[n - 1])) {
-        s[--n] = '\0';
+static int is_broadcast_mac(const uint8_t mac[MAC_LEN]) {
+    for (int i = 0; i < MAC_LEN; i++) {
+        if (mac[i] != 0xff) return 0;
     }
+    return 1;
 }
 
-static int load_routes(const char *path, struct route_entry routes[MAX_ROUTES]) {
-    FILE *fp = fopen(path, "r");
-    if (fp == NULL) {
-        perror("fopen(route_table_file)");
-        return -1;
-    }
-
-    int count = 0;
-    char line[256];
-    int line_no = 0;
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        line_no++;
-        trim(line);
-        char *p = line;
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (*p == '\0' || *p == '#') {
-            continue;
-        }
-
-        char ip_text[64];
-        char mac_text[64];
-        if (sscanf(p, "%63s %63s", ip_text, mac_text) != 2) {
-            fprintf(stderr, "Invalid route line %d: %s\n", line_no, line);
-            fclose(fp);
-            return -1;
-        }
-        if (count >= MAX_ROUTES) {
-            fprintf(stderr, "Too many routes (max=%d)\n", MAX_ROUTES);
-            fclose(fp);
-            return -1;
-        }
-
-        routes[count].dst_ip_be = parse_ipv4_or_die(ip_text);
-        if (parse_mac(mac_text, routes[count].next_mac) != 0) {
-            fprintf(stderr, "Invalid MAC in line %d: %s\n", line_no, mac_text);
-            fclose(fp);
-            return -1;
-        }
-        count++;
-    }
-
-    fclose(fp);
-    return count;
-}
-
+//查表就是对比ip地址
 static const struct route_entry *lookup_route(uint32_t dst_ip_be,
                                                const struct route_entry routes[MAX_ROUTES],
                                                int route_count) {
@@ -116,17 +70,28 @@ static const struct route_entry *lookup_route(uint32_t dst_ip_be,
 
 int main(int argc, char **argv) {
     const char *iface = DEFAULT_IFACE;
-    const char *route_file = DEFAULT_ROUTE_FILE;
-    if (argc == 3) {
-        iface = argv[1];
-        route_file = argv[2];
+    struct route_entry routes[MAX_ROUTES];
+    int route_count = 0;
+
+    if (argc < 4 || (argc % 2) != 0) {
+        usage(argv[0]);
+        return 1;
+    }
+    iface = argv[1];
+    route_count = (argc - 2) / 2;
+    if (route_count > MAX_ROUTES) {
+        fprintf(stderr, "Too many routes (max=%d)\n", MAX_ROUTES);
+        return 1;
     }
 
-    struct route_entry routes[MAX_ROUTES];
-    int route_count = load_routes(route_file, routes);
-    if (route_count <= 0) {
-        fprintf(stderr, "No valid routes loaded from %s\n", route_file);
-        return 1;
+    for (int i = 0; i < route_count; i++) {
+        const char *ip_text = argv[2 + i * 2];
+        const char *mac_text = argv[3 + i * 2];
+        routes[i].dst_ip_be = parse_ipv4_or_die(ip_text);
+        if (parse_mac(mac_text, routes[i].next_mac) != 0) {
+            fprintf(stderr, "Invalid MAC: %s\n", mac_text);
+            return 1;
+        }
     }
 
     int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
@@ -153,7 +118,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("Table router on %s, loaded %d route(s) from %s\n", iface, route_count, route_file);
+    char iface_mac_str[18];
+    mac_to_str(iface_mac, iface_mac_str);
+    printf("Table router on %s (iface MAC %s), loaded %d route(s) from CLI\n",
+           iface, iface_mac_str, route_count);
+    for (int i = 0; i < route_count; i++) {
+        char ip_str[INET_ADDRSTRLEN];
+        char nh_str[18];
+        ip_to_str(routes[i].dst_ip_be, ip_str);
+        mac_to_str(routes[i].next_mac, nh_str);
+        printf("  route %d: dst=%s -> next-hop MAC %s\n", i + 1, ip_str, nh_str);
+    }
 
     while (1) {
         unsigned char buf[BUFSIZE];
@@ -169,6 +144,13 @@ int main(int argc, char **argv) {
 
         struct ethhdr *eth = (struct ethhdr *)buf;
         if (ntohs(eth->h_proto) != ETH_P_IP) {
+            continue;
+        }
+        // 过滤乱七八糟的
+        if (memcmp(eth->h_dest, iface_mac, MAC_LEN) != 0) {
+            continue;
+        }
+        if ((eth->h_dest[0] & 0x01) != 0 || is_broadcast_mac(eth->h_dest)) {
             continue;
         }
         if (memcmp(eth->h_source, iface_mac, MAC_LEN) == 0) {
@@ -206,6 +188,7 @@ int main(int argc, char **argv) {
         ip->check = 0;
         ip->check = htons(ip_checksum(ip, (size_t)ip->ihl * 4));
 
+        //设置修改数据包对应的字段,这样就能正确路由,只是修改第一个头
         memcpy(eth->h_dest, route->next_mac, MAC_LEN);
         memcpy(eth->h_source, iface_mac, MAC_LEN);
 
@@ -226,7 +209,7 @@ int main(int argc, char **argv) {
         mac_to_str(eth->h_dest, out_dst_mac);
         mac_to_str(route->next_mac, nh_mac);
         now_str(ts);
-        printf("[%s] TX IPv4: MAC %s -> %s, IP %s -> %s, TTL=%u, next-hop=%s\n",
-               ts, out_src_mac, out_dst_mac, src_ip, dst_ip, old_ttl - 1, nh_mac);
+        printf("[%s] TX IPv4 on %s: MAC %s -> %s, IP %s -> %s, TTL=%u, next-hop=%s\n",
+               ts, iface, out_src_mac, out_dst_mac, src_ip, dst_ip, old_ttl - 1, nh_mac);
     }
 }
